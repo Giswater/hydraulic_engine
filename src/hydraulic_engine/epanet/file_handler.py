@@ -7,22 +7,21 @@ or (at your option) any later version.
 # -*- coding: utf-8 -*-
 import os
 import tempfile
+import wntr
 
+from wntr.epanet.io import BinFile
 from typing import Optional
 from abc import ABC, abstractmethod
 from pathlib import Path
-from swmm_api import read_out_file
-from swmm_api import read_rpt_file
-from swmm_api import read_inp_file
 
 from ..utils import tools_log
 
 
-class SwmmFileHandler:
+class EpanetFileHandler:
     """
-    Handler for SWMM files.
+    Handler for EPANET files.
     
-    Provides functionality to read and parse SWMM files.     
+    Provides functionality to read and parse EPANET files.     
     """
 
     def __init__(self):
@@ -45,12 +44,23 @@ class SwmmFileHandler:
 
         try:
             self.file_path = file_path
-            if file_path.endswith(".out"):
-                self.file_object = read_out_file(file_path)
+            if file_path.endswith(".bin"):
+                try:
+                    bin_file = BinFile()
+                    bin_file.read(file_path)
+                except:
+                    self.error_msg = f"Error reading {file_path}"
+                    tools_log.log_error(self.error_msg)
+                if bin_file.results is not None:
+                    self.file_object = bin_file.results
+                else:
+                    self.error_msg = f"No results found in {file_path}"
+                    tools_log.log_error(self.error_msg)
+                    return False
             elif file_path.endswith(".rpt"):
-                self.file_object = read_rpt_file(file_path)
+                pass
             elif file_path.endswith(".inp"):
-                self.file_object = read_inp_file(file_path)
+                self.file_object = wntr.network.WaterNetworkModel(file_path)
             else:
                 self.error_msg = f"Unsupported file type: {file_path}"
                 tools_log.log_error(self.error_msg)
@@ -99,9 +109,9 @@ class SwmmFileHandler:
         """Exit context manager."""
         self.cleanup()
 
-class SwmmResultHandler(ABC):
+class EpanetResultHandler(ABC):
     """
-    Handler for SWMM result files.
+    Handler for EPANET result files.
     
     Defines the exporting methods for result files.
     """

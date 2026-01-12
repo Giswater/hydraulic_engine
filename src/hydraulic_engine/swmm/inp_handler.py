@@ -100,7 +100,7 @@ class SwmmInpHandler(SwmmFileHandler):
     # Update INP file from settings
     # =========================================================================
 
-    def _update_inp_from_settings(
+    def update_inp_from_settings(
         self,
         feature_settings: Optional[SwmmFeatureSettings] = None,
         options_settings: Optional[SwmmOptionsSettings] = None,

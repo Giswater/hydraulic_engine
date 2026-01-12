@@ -17,6 +17,7 @@ __email__ = "info@bgeo.es"
 
 from .config import config
 from . import swmm
+from . import epanet
 
 __all__ = [
     "__version__",
@@ -24,4 +25,5 @@ __all__ = [
     "__email__",
     "config",
     "swmm",
+    "epanet",
 ]

@@ -9,6 +9,7 @@ import os
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable
+from pyswmm import Simulation
 
 from ..utils.enums import RunStatus, ExportDataSource
 from .rpt_handler import SwmmRptHandler
@@ -43,29 +44,34 @@ class SwmmRunner:
     allowing for real-time interaction and progress tracking during simulations.
     
     Example usage:
-        runner = SwmmRunner()
-        result = runner.run("model.inp")
-        
-        # Or with custom output paths
-        result = runner.run(
+        # Run simulation
+        runner = SwmmRunner(
             inp_path="model.inp",
             rpt_path="results.rpt",
-            out_path="results.out"
+            out_path="results.out",
+            progress_callback=on_progress
         )
-        
-        # With progress callback
-        def on_progress(progress, message):
-            print(f"[{progress}%] {message}")
-        
-        runner.set_progress_callback(on_progress)
-        result = runner.run("model.inp")
+        result = runner.run()
+
+        # Check results
+        if result.status == RunStatus.SUCCESS:
+            print(f"Simulation completed successfully in {result.duration_seconds:.2f}s")
+            print(f"RPT file: {result.rpt_path}")
+            print(f"OUT file: {result.out_path}")
+        else:
+            print(f"Simulation failed: {result.errors}")
+
+        # Export results to database
+        runner.export_result(ExportDataSource.DATABASE)
     """
 
-    def __init__(self,
-                inp_path: Optional[str] = None,
-                rpt_path: Optional[str] = None,
-                out_path: Optional[str] = None,
-                progress_callback: Optional[Callable[[int, str], None]] = None):
+    def __init__(
+        self,
+        inp_path: Optional[str] = None,
+        rpt_path: Optional[str] = None,
+        out_path: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None
+    ):
         """Initialize SWMM runner."""
         self.inp_path = inp_path
         self.rpt_path = rpt_path
@@ -111,6 +117,10 @@ class SwmmRunner:
         :param inp_path: Path to INP file
         :param rpt_path: Path for RPT output (optional, derived from inp_path if not provided)
         :param out_path: Path for OUT binary output (optional, derived from inp_path if not provided)
+        :param feature_settings: Feature settings for the simulation
+        :param options_settings: Options settings for the simulation
+        :param other_settings: Other settings for the simulation
+        :param step_callback: Callback function to track simulation progress
         :return: SwmmRunResult with simulation results
         """
         result = SwmmRunResult()
@@ -142,7 +152,7 @@ class SwmmRunner:
 
         # Modify the INP file with the feature settings, options settings and other settings
         try:
-            self.inp._update_inp_from_settings(
+            self.inp.update_inp_from_settings(
                 feature_settings=feature_settings,
                 options_settings=options_settings,
                 other_settings=other_settings,
@@ -166,14 +176,13 @@ class SwmmRunner:
         Run simulation using pyswmm library.
         
         :param result: SwmmRunResult object to populate
+        :param step_callback: Callback function to track simulation progress
         :return: Updated SwmmRunResult
         """
         import time
         start_time = time.time()
 
         try:
-            from pyswmm import Simulation
-
             self._report_progress(10, "Initializing SWMM engine...")
 
             # Create simulation with output files
@@ -239,9 +248,16 @@ class SwmmRunner:
             if os.path.isfile(result.rpt_path):
                 # Parse RPT for errors/warnings
                 self._parse_rpt_status(result)
+                self.rpt.load_result(result.rpt_path)
             else:
                 result.status = RunStatus.ERROR
                 result.errors.append("RPT file was not created")
+
+            if os.path.isfile(result.out_path):
+                self.out.load_result(result.out_path)
+            else:
+                result.status = RunStatus.ERROR
+                result.errors.append("OUT file was not created")
 
             result.duration_seconds = time.time() - start_time
 
@@ -311,18 +327,6 @@ class SwmmRunner:
         """
 
         if to == ExportDataSource.DATABASE:
-            rpt_handler = SwmmRptHandler()
-            rpt_handler_loaded = rpt_handler.load_result(self.rpt_path)
-            if not rpt_handler_loaded:
-                tools_log.log_error(f"Failed to load RPT file: {self.rpt_path}")
-                return
-            self.rpt = rpt_handler
-            rpt_handler.export_to_database()
+            self.rpt.export_to_database()
         elif to == ExportDataSource.FROST:
-            out_handler = SwmmOutHandler()
-            out_handler_loaded = out_handler.load_result(self.out_path)
-            if not out_handler_loaded:
-                tools_log.log_error(f"Failed to load OUT file: {self.out_path}")
-                return
-            self.out = out_handler
-            out_handler.export_to_frost()
+            self.out.export_to_frost()

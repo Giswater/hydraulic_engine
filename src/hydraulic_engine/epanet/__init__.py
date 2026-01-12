@@ -9,10 +9,95 @@ EPANET module - Water distribution system modeling functionality.
 # -*- coding: utf-8 -*-
 from .runner import EpanetRunner
 from .inp_handler import EpanetInpHandler
-from .rpt_handler import EpanetRptHandler
+from .bin_handler import EpanetBinHandler
+
+# Model classes
+from .models import (
+    # Base
+    EpanetBaseObject,
+    # Enums - Features
+    EpanetLinkStatus,
+    EpanetValveType,
+    EpanetMixingModel,
+    # Enums - Options
+    EpanetFlowUnits,
+    EpanetHeadlossFormula,
+    EpanetQualityType,
+    EpanetDemandModel,
+    EpanetStatistic,
+    EpanetUnbalanced,
+    # Enums - Other
+    EpanetCurveType,
+    # Extra classes
+    EpanetDemand,
+    # Node classes
+    EpanetNode,
+    EpanetJunction,
+    EpanetReservoir,
+    EpanetTank,
+    # Link classes
+    EpanetLink,
+    EpanetPipe,
+    EpanetPump,
+    EpanetValve,
+    # Other classes
+    EpanetPattern,
+    EpanetCurve,
+    # Option classes (mirroring WNTR structure)
+    EpanetHydraulicOptions,
+    EpanetQualityOptions,
+    EpanetTimeOptions,
+    EpanetEnergyOptions,
+    EpanetReactionOptions,
+    # Settings classes
+    EpanetFeatureSettings,
+    EpanetOptionsSettings,
+    EpanetOtherSettings,
+)
 
 __all__ = [
+    # Handlers and Runner
     "EpanetRunner",
     "EpanetInpHandler",
-    "EpanetRptHandler",
+    "EpanetBinHandler",
+    # Base
+    "EpanetBaseObject",
+    # Enums - Features
+    "EpanetLinkStatus",
+    "EpanetValveType",
+    "EpanetMixingModel",
+    # Enums - Options
+    "EpanetFlowUnits",
+    "EpanetHeadlossFormula",
+    "EpanetQualityType",
+    "EpanetDemandModel",
+    "EpanetStatistic",
+    "EpanetUnbalanced",
+    # Enums - Other
+    "EpanetCurveType",
+    # Extra classes
+    "EpanetDemand",
+    # Node classes
+    "EpanetNode",
+    "EpanetJunction",
+    "EpanetReservoir",
+    "EpanetTank",
+    # Link classes
+    "EpanetLink",
+    "EpanetPipe",
+    "EpanetPump",
+    "EpanetValve",
+    # Other classes
+    "EpanetPattern",
+    "EpanetCurve",
+    # Option classes (mirroring WNTR structure)
+    "EpanetHydraulicOptions",
+    "EpanetQualityOptions",
+    "EpanetTimeOptions",
+    "EpanetEnergyOptions",
+    "EpanetReactionOptions",
+    # Settings classes
+    "EpanetFeatureSettings",
+    "EpanetOptionsSettings",
+    "EpanetOtherSettings",
 ]

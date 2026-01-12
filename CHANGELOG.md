@@ -16,5 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SWMM inp, rpt and out handler files
 - Parameter management to the SWMM simulation
 - SWMM models file
+- EPANET runner file
+- EPANET inp, rpt and out handler files
+- Parameter management to the EPANET simulation
+- EPANET models file
 
 [unreleased]: https://github.com/Giswater/hydraulic_engine/commits/master/
