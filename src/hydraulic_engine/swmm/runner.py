@@ -348,7 +348,6 @@ class SwmmRunner:
                 max_workers=max_workers,
                 crs_from=crs_from,
                 crs_to=crs_to,
-                start_time=start_time,
                 client=client,
             )
 
