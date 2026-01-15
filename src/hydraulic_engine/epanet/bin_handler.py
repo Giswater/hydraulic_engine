@@ -179,7 +179,7 @@ def _prepare_nodes_data(wn: wntr.network.WaterNetworkModel) -> List[Dict]:
     """Extract node data from WNTR water network model."""
     nodes_data = []
     for node_name, node in wn.nodes():
-        node_type = tools_sensorthings.get_epanet_node_type(node_name)
+        node_type = tools_sensorthings.get_epanet_node_type(node)
 
         # Get coordinates
         coords = node.coordinates
