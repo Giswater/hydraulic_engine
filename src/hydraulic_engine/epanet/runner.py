@@ -172,7 +172,12 @@ class EpanetRunner:
 
         return self._run_with_epanet(result, step_callback, calculate_water_quality)
 
-    def _run_with_epanet(self, result: EpanetRunResult, step_callback: Optional[Callable[[Any, int], bool]] = None, calculate_water_quality: bool = True) -> EpanetRunResult:
+    def _run_with_epanet(
+        self,
+        result: EpanetRunResult,
+        step_callback: Optional[Callable[[Any, int], bool]] = None,
+        calculate_water_quality: bool = True
+    ) -> EpanetRunResult:
         """
         Run the EPANET simulation step-by-step using the EPANET toolkit.
         
@@ -260,14 +265,21 @@ class EpanetRunner:
 
         return result
 
-    def _run_hydraulic_simulation(self, enData: toolkit.ENepanet, duration: int, step_callback: Optional[Callable[[Any, int], bool]] = None) -> int:
+    def _run_hydraulic_simulation(
+        self,
+        enData: toolkit.ENepanet,
+        duration: int,
+        step_callback: Optional[Callable[[Any, int], bool]] = None,
+    ) -> int:
         """
         Run the hydraulic simulation step-by-step using the EPANET toolkit.
         
         :param enData: EPANET project handle
-        :param duration: Simulation duration
+        :param duration: Simulation duration in seconds
         :param step_callback: Callback function to track simulation progress
+        :return: Step count
         """
+
         enData.ENopenH()
         enData.ENinitH(EN.SAVE)
 
@@ -396,6 +408,7 @@ class EpanetRunner:
             crs_from: int = 25831,
             crs_to: int = 4326,
             start_time: Optional[datetime] = None,
+            round_decimals: int = 2,
             client: Optional[HeFrostClient] = None,
         ) -> bool:
         """
@@ -403,9 +416,9 @@ class EpanetRunner:
         """
 
         if to == ExportDataSource.DATABASE:
-            pass
+            return self.bin.export_to_database(result_id=result_id, inp_handler=self.inp, round_decimals=round_decimals, dao=client)
         elif to == ExportDataSource.FROST:
-            self.bin.export_to_frost(
+            return self.bin.export_to_frost(
                 inp_handler=self.inp,
                 result_id=result_id,
                 batch_size=batch_size,
@@ -415,5 +428,3 @@ class EpanetRunner:
                 start_time=start_time,
                 client=client
             )
-
-        return True

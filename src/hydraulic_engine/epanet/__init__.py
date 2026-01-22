@@ -7,7 +7,7 @@ or (at your option) any later version.
 EPANET module - Water distribution system modeling functionality.
 """
 # -*- coding: utf-8 -*-
-from .runner import EpanetRunner
+from .runner import EpanetRunner, EpanetRunResult
 from .inp_handler import EpanetInpHandler
 from .bin_handler import EpanetBinHandler
 
@@ -58,6 +58,7 @@ from .models import (
 __all__ = [
     # Handlers and Runner
     "EpanetRunner",
+    "EpanetRunResult",
     "EpanetInpHandler",
     "EpanetBinHandler",
     # Base

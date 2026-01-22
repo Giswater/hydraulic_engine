@@ -339,9 +339,9 @@ class SwmmRunner:
         """
 
         if to == ExportDataSource.DATABASE:
-            self.rpt.export_to_database()
+            pass
         elif to == ExportDataSource.FROST:
-            self.out.export_to_frost(
+            return self.out.export_to_frost(
                 inp_handler=self.inp,
                 result_id=result_id,
                 batch_size=batch_size,
@@ -350,5 +350,3 @@ class SwmmRunner:
                 crs_to=crs_to,
                 client=client,
             )
-
-        return True

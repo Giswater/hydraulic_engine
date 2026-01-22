@@ -11,11 +11,14 @@ from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from pyproj import Transformer
 from datetime import timedelta
+from wntr.epanet.util import from_si
 
 from .file_handler import EpanetResultHandler, EpanetFileHandler
+from .inp_handler import EpanetInpHandler
 from ..utils import tools_log
 from ..utils.tools_api import get_api_client, HeFrostClient
 from ..utils import tools_sensorthings
+from ..utils.tools_db import HePgDao, get_connection
 
 
 class EpanetBinHandler(EpanetFileHandler, EpanetResultHandler):
@@ -31,20 +34,98 @@ class EpanetBinHandler(EpanetFileHandler, EpanetResultHandler):
         handler = EpanetBinHandler()
         handler.load_file("results.bin")
         handler.export_to_frost(inp_handler=inp_handler, result_id="test1")
+        handler.export_to_database(result_id="test1")
     """
 
-    def export_to_database(self) -> bool:
-        """Export simulation results to database."""
-        # TODO: Implement export to database
-        tools_log.log_warning("Export to database not yet implemented")
-        return False
+    def export_to_database(
+            self,
+            result_id: str,
+            inp_handler: EpanetInpHandler,
+            round_decimals: int = 2,
+            dao: Optional[HePgDao] = None
+        ) -> bool:
+        """
+        Export simulation results to Giswater database.
+        
+        Fills the following tables:
+        - rpt_node: Time series node results (demand, head, pressure, quality)
+        - rpt_arc: Time series arc results (flow, velocity, headloss, etc.)
+        - rpt_node_stats: Aggregated node statistics (max/min/avg)
+        - rpt_arc_stats: Aggregated arc statistics (max/min/avg)
+        - selector_rpt_main: Sets the current result for visualization
+        - rpt_cat_result: Updates execution metadata
+        
+        Prerequisites:
+        - The rpt_inp_node and rpt_inp_arc tables must be populated by the plugin
+          (via gw_fct_pg2epa_main) before calling this method.
+        
+        :param result_id: The result identifier (must match rpt_cat_result.result_id)
+        :param inp_handler: INP handler to get coordinates
+        :param round_decimals: Number of decimal places to round the results (default: 2)
+        :param dao: Database access object (optional, uses global connection if not provided)
+        :return: True if export successful, False otherwise
+        """
+        if not self.is_loaded():
+            tools_log.log_error("No binary file loaded")
+            return False
 
+        # Get database connection
+        if dao is None:
+            dao = get_connection()
 
-# region Export to FROST-Server
+        if dao is None or not dao.is_connected():
+            tools_log.log_error("No database connection available")
+            return False
+
+        results: wntr.sim.SimulationResults = self.file_object
+
+        try:
+            tools_log.log_info(f"Starting export to database for result_id: {result_id}")
+
+            # Step 1: Clean previous results for this result_id
+            tools_log.log_info("Cleaning previous results...")
+            if not _clean_previous_results(dao, result_id):
+                return False
+
+            # Step 2: Insert time series data into rpt_node
+            tools_log.log_info("Inserting node results...")
+            node_count = _insert_node_results(dao, results, result_id, inp_handler, round_decimals)
+            tools_log.log_info(f"Inserted {node_count} node result records")
+
+            # Step 3: Insert time series data into rpt_arc
+            tools_log.log_info("Inserting arc results...")
+            arc_count = _insert_arc_results(dao, results, result_id, inp_handler, round_decimals)
+            tools_log.log_info(f"Inserted {arc_count} arc result records")
+
+            # Step 4: Post-process arcs (reverse geometry for negative flows)
+            tools_log.log_info("Post-processing arc results...")
+            _post_process_arcs(dao, result_id)
+
+            # Step 5: Calculate and insert node statistics
+            tools_log.log_info("Calculating node statistics...")
+            _insert_node_stats(dao, result_id)
+
+            # Step 6: Calculate and insert arc statistics
+            tools_log.log_info("Calculating arc statistics...")
+            _insert_arc_stats(dao, result_id)
+
+            # Step 8: Update rpt_cat_result and selectors
+            tools_log.log_info("Updating result catalog and selectors...")
+            _finalize_import(dao, result_id)
+
+            # Commit all changes
+            dao.commit()
+            tools_log.log_info(f"Export to database completed successfully for result_id: {result_id}")
+            return True
+
+        except Exception as e:
+            tools_log.log_error(f"Error exporting to database: {e}")
+            dao.rollback()
+            return False
 
     def export_to_frost(
             self,
-            inp_handler: wntr.network.WaterNetworkModel,
+            inp_handler: EpanetFileHandler,
             result_id: str,
             batch_size: int = 50,
             max_workers: int = 4,
@@ -171,9 +252,416 @@ class EpanetBinHandler(EpanetFileHandler, EpanetResultHandler):
         tools_log.log_info("Processing completed!")
         return True
 
+
+# region Export to Database Helper Functions
+
+def _seconds_to_time_str(seconds: int) -> str:
+    """
+    Convert seconds to HH:MM:SS time string format.
+    
+    :param seconds: Time in seconds
+    :return: Time string in HH:MM:SS format
+    """
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def _clean_previous_results(dao: HePgDao, result_id: str) -> bool:
+    """
+    Clean previous results for the given result_id from all rpt tables.
+    
+    :param dao: Database access object
+    :param result_id: Result identifier
+    :return: True if successful
+    """
+    tables_to_clean = [
+        'rpt_node',
+        'rpt_arc',
+        'rpt_node_stats',
+        'rpt_arc_stats',
+        'rpt_energy_usage',
+        'rpt_hydraulic_status'
+    ]
+
+    for table in tables_to_clean:
+        sql = f"DELETE FROM {table} WHERE result_id = %s"
+        if not dao.execute(sql, (result_id,), commit=False):
+            tools_log.log_error(f"Failed to clean {table}")
+            return False
+
+    return True
+
+
+def _insert_node_results(dao: HePgDao, results: wntr.sim.SimulationResults, result_id: str, inp_handler: EpanetInpHandler, round_decimals: int = 2) -> int:
+    """
+    Insert time series node results into rpt_node table.
+    
+    :param dao: Database access object
+    :param results: WNTR SimulationResults object
+    :param result_id: Result identifier
+    :param inp_handler: INP handler to get node values
+    :param round_decimals: Number of decimal places to round the results (default: 2)
+    :return: Number of records inserted
+    """
+    count = 0
+
+    # Get unit system
+    try:
+        unit_system = getattr(wntr.epanet.util.FlowUnits, inp_handler.file_object.options.hydraulic.inpfile_units)
+        if unit_system is None:
+            tools_log.log_error(f"Invalid unit system: {inp_handler.file_object.options.hydraulic.inpfile_units}")
+            return 0
+    except Exception as e:
+        tools_log.log_error(f"Error getting unit system: {e}")
+        return 0
+
+    # Get available node result types
+    node_data = results.node
+    if node_data is None:
+        return 0
+
+    # Get all node IDs from demand (always present)
+    if 'demand' not in node_data:
+        tools_log.log_warning("No demand data found in results")
+        return 0
+
+    demand_df = node_data['demand']
+    node_ids = demand_df.columns.tolist()
+    time_steps = demand_df.index.tolist()
+
+    # Prepare data for bulk insert
+    records = []
+    for time_sec in time_steps:
+        time_str = _seconds_to_time_str(int(time_sec))
+        for node_id in node_ids:
+            top_elev = _convert_from_si(
+                value=inp_handler.file_object.nodes[node_id].elevation,
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.Elevation,
+                round_decimals=round_decimals
+            ) if getattr(inp_handler.file_object.nodes[node_id], 'elevation', None) is not None else None
+            demand = _convert_from_si(
+                value=demand_df.loc[time_sec, node_id],
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.Demand,
+                round_decimals=round_decimals
+            ) if 'demand' in node_data else None
+            head = _convert_from_si(
+                value=node_data['head'].loc[time_sec, node_id],
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.HydraulicHead,
+                round_decimals=round_decimals
+            ) if 'head' in node_data else None
+            pressure = _convert_from_si(
+                value=node_data['pressure'].loc[time_sec, node_id],
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.Pressure,
+                round_decimals=round_decimals
+            ) if 'pressure' in node_data else None
+            quality = round(float(node_data['quality'].loc[time_sec, node_id]), round_decimals) if 'quality' in node_data else None
+
+            records.append((result_id, node_id, time_str, top_elev, demand, head, pressure, quality))
+
+    # Bulk insert using executemany
+    sql = """
+        INSERT INTO rpt_node (result_id, node_id, time, top_elev, demand, head, press, quality)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    try:
+        if dao.cursor:
+            dao.cursor.executemany(sql, records)
+            count = len(records)
+    except Exception as e:
+        tools_log.log_error(f"Error inserting node results: {e}")
+        return 0
+
+    return count
+
+
+def _insert_arc_results(dao: HePgDao, results: wntr.sim.SimulationResults, result_id: str, inp_handler: EpanetInpHandler, round_decimals: int = 2) -> int:
+    """
+    Insert time series arc results into rpt_arc table.
+    
+    :param dao: Database access object
+    :param results: WNTR SimulationResults object
+    :param result_id: Result identifier
+    :param inp_handler: INP handler to get link values
+    :param round_decimals: Number of decimal places to round the results (default: 2)
+    :return: Number of records inserted
+    """
+    count = 0
+
+    # Get unit system
+    try:
+        unit_system = getattr(wntr.epanet.util.FlowUnits, inp_handler.file_object.options.hydraulic.inpfile_units)
+        if unit_system is None:
+            tools_log.log_error(f"Invalid unit system: {inp_handler.file_object.options.hydraulic.inpfile_units}")
+            return 0
+    except Exception as e:
+        tools_log.log_error(f"Error getting unit system: {e}")
+        return 0
+
+    # Get available link result types
+    link_data = results.link
+    if link_data is None:
+        return 0
+
+    # Get all link IDs from flowrate (always present)
+    if 'flowrate' not in link_data:
+        tools_log.log_warning("No flowrate data found in results")
+        return 0
+
+    flow_df = link_data['flowrate']
+    link_ids = flow_df.columns.tolist()
+    time_steps = flow_df.index.tolist()
+
+    # Prepare data for bulk insert
+    records = []
+    for time_sec in time_steps:
+        time_str = _seconds_to_time_str(int(time_sec))
+        for link_id in link_ids:
+            length = _convert_from_si(
+                value=inp_handler.file_object.links[link_id].length,
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.Length,
+                round_decimals=round_decimals
+            ) if getattr(inp_handler.file_object.links[link_id], 'length', None) is not None else None
+            diameter = _convert_from_si(
+                value=inp_handler.file_object.links[link_id].diameter,
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.PipeDiameter,
+                round_decimals=round_decimals
+            ) if getattr(inp_handler.file_object.links[link_id], 'diameter', None) is not None else None
+            flow = _convert_from_si(
+                value=flow_df.loc[time_sec, link_id],
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.Flow,
+                round_decimals=round_decimals
+            ) if 'flowrate' in link_data else None
+            velocity = _convert_from_si(
+                value=link_data['velocity'].loc[time_sec, link_id],
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.Velocity,
+                round_decimals=round_decimals
+            ) if 'velocity' in link_data else None
+            headloss = _convert_from_si(
+                value=link_data['headloss'].loc[time_sec, link_id],
+                unit_system=unit_system,
+                param=wntr.epanet.util.HydParam.HeadLoss,
+                round_decimals=round_decimals
+            ) if 'headloss' in link_data else None
+            setting = round(float(link_data['setting'].loc[time_sec, link_id]), round_decimals) if 'setting' in link_data else None
+            reaction = round(float(link_data['reaction_rate'].loc[time_sec, link_id]), round_decimals) if 'reaction_rate' in link_data else None
+            ffactor = round(float(link_data['friction_factor'].loc[time_sec, link_id]), round_decimals) if 'friction_factor' in link_data else None
+
+            # Get status as text
+            status = None
+            if 'status' in link_data:
+                status_val = int(link_data['status'].loc[time_sec, link_id])
+                status_map = {0: 'CLOSED', 1: 'OPEN', 2: 'ACTIVE'}
+                status = status_map.get(status_val, str(status_val))
+
+            records.append((result_id, link_id, time_str, length, diameter, flow, velocity, headloss, setting, reaction, ffactor, status))
+
+    # Bulk insert using executemany
+    sql = """
+        INSERT INTO rpt_arc (result_id, arc_id, time, length, diameter, flow, vel, headloss, setting, reaction, ffactor, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    try:
+        if dao.cursor:
+            dao.cursor.executemany(sql, records)
+            count = len(records)
+    except Exception as e:
+        tools_log.log_error(f"Error inserting arc results: {e}")
+        return 0
+
+    return count
+
+
+def _post_process_arcs(dao: HePgDao, result_id: str) -> None:
+    """
+    Post-process arc results:
+    - Reverse geometry in rpt_inp_arc where flow is negative
+    - Update flow values to absolute value in rpt_arc
+    
+    :param dao: Database access object
+    :param result_id: Result identifier
+    """
+    # Reverse geometries where flow is negative
+    sql_reverse = """
+        UPDATE rpt_inp_arc 
+        SET the_geom = ST_Reverse(the_geom) 
+        FROM rpt_arc 
+        WHERE rpt_arc.arc_id::text = rpt_inp_arc.arc_id 
+        AND rpt_arc.flow < 0 
+        AND rpt_inp_arc.result_id = %s
+    """
+    dao.execute(sql_reverse, (result_id,), commit=False)
+
+    # Update flow to absolute value
+    sql_abs_flow = """
+        UPDATE rpt_arc 
+        SET flow = ABS(flow) 
+        WHERE flow < 0 AND result_id = %s
+    """
+    dao.execute(sql_abs_flow, (result_id,), commit=False)
+
+
+def _insert_node_stats(dao: HePgDao, result_id: str) -> None:
+    """
+    Calculate and insert node statistics into rpt_node_stats table.
+    
+    Statistics are calculated by aggregating rpt_node values and joining
+    with rpt_inp_node for metadata and geometry.
+    
+    :param dao: Database access object
+    :param result_id: Result identifier
+    """
+    sql = """
+        INSERT INTO rpt_node_stats (
+            node_id, result_id, node_type, sector_id, nodecat_id, top_elev,
+            demand_max, demand_min, demand_avg,
+            head_max, head_min, head_avg,
+            press_max, press_min, press_avg,
+            quality_max, quality_min, quality_avg,
+            the_geom
+        )
+        SELECT 
+            node.node_id,
+            %s as result_id,
+            node.node_type,
+            node.sector_id,
+            node.nodecat_id,
+            MAX(rpt.head) as top_elev,
+            MAX(rpt.demand) AS demand_max,
+            MIN(rpt.demand) AS demand_min,
+            AVG(rpt.demand)::numeric(12,2) AS demand_avg,
+            MAX(rpt.head) AS head_max,
+            MIN(rpt.head) AS head_min,
+            AVG(rpt.head)::numeric(12,2) AS head_avg,
+            MAX(rpt.press) AS press_max,
+            MIN(rpt.press) AS press_min,
+            AVG(rpt.press)::numeric(12,2) AS press_avg,
+            MAX(rpt.quality) AS quality_max,
+            MIN(rpt.quality) AS quality_min,
+            AVG(rpt.quality)::numeric(12,2) AS quality_avg,
+            node.the_geom
+        FROM rpt_inp_node node
+        JOIN rpt_node rpt ON rpt.node_id::text = node.node_id::text
+        WHERE node.result_id = %s AND rpt.result_id = %s
+        GROUP BY node.node_id, node.node_type, node.sector_id, node.nodecat_id, node.the_geom
+        ORDER BY node.node_id
+    """
+    dao.execute(sql, (result_id, result_id, result_id), commit=False)
+
+
+def _insert_arc_stats(dao: HePgDao, result_id: str) -> None:
+    """
+    Calculate and insert arc statistics into rpt_arc_stats table.
+    
+    Statistics are calculated by aggregating rpt_arc values and joining
+    with rpt_inp_arc for metadata and geometry.
+    
+    :param dao: Database access object
+    :param result_id: Result identifier
+    """
+    sql = """
+        INSERT INTO rpt_arc_stats (
+            arc_id, result_id, arc_type, sector_id, arccat_id,
+            flow_max, flow_min, flow_avg,
+            vel_max, vel_min, vel_avg,
+            headloss_max, headloss_min,
+            setting_max, setting_min,
+            reaction_max, reaction_min,
+            ffactor_max, ffactor_min,
+            length, tot_headloss_max, tot_headloss_min,
+            the_geom
+        )
+        SELECT 
+            arc.arc_id,
+            %s as result_id,
+            arc.arc_type,
+            arc.sector_id,
+            arc.arccat_id,
+            MAX(rpt.flow) AS flow_max,
+            MIN(rpt.flow) AS flow_min,
+            AVG(rpt.flow)::numeric(12,2) AS flow_avg,
+            MAX(rpt.vel) AS vel_max,
+            MIN(rpt.vel) AS vel_min,
+            AVG(rpt.vel)::numeric(12,2) AS vel_avg,
+            MAX(rpt.headloss) AS headloss_max,
+            MIN(rpt.headloss) AS headloss_min,
+            MAX(rpt.setting) AS setting_max,
+            MIN(rpt.setting) AS setting_min,
+            MAX(rpt.reaction) AS reaction_max,
+            MIN(rpt.reaction) AS reaction_min,
+            MAX(rpt.ffactor) AS ffactor_max,
+            MIN(rpt.ffactor) AS ffactor_min,
+            arc.length,
+            (MAX(rpt.headloss) * arc.length / 1000)::numeric(12, 2) AS tot_headloss_max,
+            (MIN(rpt.headloss) * arc.length / 1000)::numeric(12, 2) AS tot_headloss_min,
+            arc.the_geom
+        FROM rpt_inp_arc arc
+        JOIN rpt_arc rpt ON rpt.arc_id::text = arc.arc_id::text
+        WHERE arc.result_id = %s AND rpt.result_id = %s
+        GROUP BY arc.arc_id, arc.arc_type, arc.sector_id, arc.arccat_id, arc.length, arc.the_geom
+        ORDER BY arc.arc_id
+    """
+    dao.execute(sql, (result_id, result_id, result_id), commit=False)
+
+
+def _finalize_import(dao: HePgDao, result_id: str) -> None:
+    """
+    Finalize the import process:
+    - Update rpt_cat_result with execution metadata
+    - Set selector_rpt_main for current user
+    - Clean up null time values
+    
+    :param dao: Database access object
+    :param result_id: Result identifier
+    """
+    # Update rpt_cat_result
+    sql_update_result = """
+        UPDATE rpt_cat_result 
+        SET exec_date = now(), cur_user = current_user, status = 2, 
+        expl_id = (SELECT array_agg(expl_id) FROM selector_expl WHERE cur_user = current_user AND expl_id > 0),
+        sector_id = (SELECT array_agg(sector_id) FROM selector_sector WHERE cur_user = current_user AND sector_id > 0)
+        WHERE result_id = %s
+    """
+    dao.execute(sql_update_result, (result_id,), commit=False)
+
+    # Set result selector for current user
+    sql_delete_selector = "DELETE FROM selector_rpt_main WHERE cur_user = current_user"
+    dao.execute(sql_delete_selector, commit=False)
+
+    sql_insert_selector = "INSERT INTO selector_rpt_main (result_id, cur_user) VALUES (%s, current_user)"
+    dao.execute(sql_insert_selector, (result_id,), commit=False)
+
+    # Clean null time values
+    sql_clean_node_time = "UPDATE rpt_node SET time = '0:00' WHERE time = 'null' AND result_id = %s"
+    dao.execute(sql_clean_node_time, (result_id,), commit=False)
+
+    sql_clean_arc_time = "UPDATE rpt_arc SET time = '0:00' WHERE time = 'null' AND result_id = %s"
+    dao.execute(sql_clean_arc_time, (result_id,), commit=False)
+
+
+
+def _convert_from_si(value: float, unit_system: wntr.epanet.util.FlowUnits, param: wntr.epanet.util.HydParam, round_decimals: int = 2) -> Optional[float]:
+    """Convert value from SI to EPANET units."""
+    try:
+        return round(float(from_si(unit_system, value, param)), round_decimals)
+    except Exception as e:
+        tools_log.log_error(f"Error converting value from SI to EPANET units: {e}")
+        return None
+
 # endregion
 
-# region Helper functions
+# region Export to FROST-Server Helper Functions
 
 def _prepare_nodes_data(wn: wntr.network.WaterNetworkModel) -> List[Dict]:
     """Extract node data from WNTR water network model."""
